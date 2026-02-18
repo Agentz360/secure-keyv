@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import { keyvApiTests, keyvValueTests } from "@keyv/test-suite";
 import Keyv from "keyv";
 import * as test from "vitest";
-import KeyvMemcache from "../src/index.js";
+import KeyvMemcache, { createKeyv } from "../src/index.js";
 
 const snooze = async (ms: number) =>
 	new Promise((resolve) => setTimeout(resolve, ms));
@@ -34,7 +34,7 @@ test.it("keyv get / no expired", async (t) => {
 
 test.it("testing defaults", (t) => {
 	const m = new KeyvMemcache();
-	t.expect(m.opts.url).toBe("localhost:11211");
+	t.expect(m.opts.nodes).toEqual(["localhost:11211"]);
 });
 
 test.it("keyv clear", async (t) => {
@@ -49,10 +49,6 @@ test.it("keyv get", async (t) => {
 	t.expect(await keyv.get("foo")).toBeUndefined();
 	await keyv.set("foo", "bar");
 	t.expect(await keyv.get("foo")).toBe("bar");
-});
-
-test.it("get namespace", (t) => {
-	t.expect(keyvMemcache._getNamespace()).toBe("namespace:keyv");
 });
 
 test.it("format key for no namespace", (t) => {
@@ -139,7 +135,68 @@ test.it("keyvMemcache getMany", async (t) => {
 	const value = await keyvMemcache.getMany(["foo0", "Foo1"]);
 	t.expect(Array.isArray(value)).toBeTruthy();
 
-	t.expect(value[0]).toEqual({ expires: 0, value: undefined });
+	t.expect(value[0]).toBeUndefined();
+});
+
+test.it("keyvMemcache setMany", async (t) => {
+	const keyv = new Keyv({ store: keyvMemcache });
+
+	await keyv.setMany([
+		{ key: "setMany1", value: "value1" },
+		{ key: "setMany2", value: "value2" },
+		{ key: "setMany3", value: "value3" },
+	]);
+
+	t.expect(await keyv.get("setMany1")).toBe("value1");
+	t.expect(await keyv.get("setMany2")).toBe("value2");
+	t.expect(await keyv.get("setMany3")).toBe("value3");
+});
+
+test.it("keyvMemcache setMany with ttl", async (t) => {
+	const keyv = new Keyv({ store: keyvMemcache });
+
+	await keyv.setMany([
+		{ key: "setManyTtl1", value: "value1", ttl: 1000 },
+		{ key: "setManyTtl2", value: "value2", ttl: 1000 },
+	]);
+
+	t.expect(await keyv.get("setManyTtl1")).toBe("value1");
+
+	await snooze(2000);
+
+	t.expect(await keyv.get("setManyTtl1")).toBeUndefined();
+});
+
+test.it("keyvMemcache hasMany", async (t) => {
+	await keyvMemcache.set("hasMany1", "value1");
+	await keyvMemcache.set("hasMany2", "value2");
+
+	const result = await keyvMemcache.hasMany([
+		"hasMany1",
+		"hasMany2",
+		"hasMany3",
+	]);
+
+	t.expect(result).toEqual([true, true, false]);
+});
+
+test.it("keyvMemcache hasMany with no keys existing", async (t) => {
+	const result = await keyvMemcache.hasMany(["noKey1", "noKey2", "noKey3"]);
+	t.expect(result).toEqual([false, false, false]);
+});
+
+test.it("keyvMemcache setMany should emit error on failure", async (t) => {
+	const badMemcache = new KeyvMemcache("baduri:11211");
+	let errorEmitted = false;
+	badMemcache.on("error", () => {
+		errorEmitted = true;
+	});
+
+	try {
+		await badMemcache.setMany([{ key: "foo", value: "bar" }]);
+	} catch {
+		t.expect(errorEmitted).toBeTruthy();
+	}
 });
 
 test.it("keyv has / false", async (t) => {
@@ -164,12 +221,7 @@ test.it("clear should emit an error", async (t) => {
 });
 
 test.it("delete should emit an error", async (t) => {
-	const options = {
-		logger: {
-			log() {},
-		},
-	};
-	const keyv = new Keyv({ store: new KeyvMemcache("baduri:11211", options) });
+	const keyv = new Keyv({ store: new KeyvMemcache("baduri:11211") });
 
 	keyv.on("error", () => {
 		t.expect(true).toBeTruthy();
@@ -181,12 +233,7 @@ test.it("delete should emit an error", async (t) => {
 });
 
 test.it("set should emit an error", async (t) => {
-	const options = {
-		logger: {
-			log() {},
-		},
-	};
-	const keyv = new Keyv({ store: new KeyvMemcache("baduri:11211", options) });
+	const keyv = new Keyv({ store: new KeyvMemcache("baduri:11211") });
 
 	keyv.on("error", () => {
 		t.expect(true).toBeTruthy();
@@ -198,12 +245,7 @@ test.it("set should emit an error", async (t) => {
 });
 
 test.it("get should emit an error", async (t) => {
-	const options = {
-		logger: {
-			log() {},
-		},
-	};
-	const keyv = new Keyv({ store: new KeyvMemcache("baduri:11211", options) });
+	const keyv = new Keyv({ store: new KeyvMemcache("baduri:11211") });
 
 	keyv.on("error", () => {
 		t.expect(true).toBeTruthy();
@@ -212,6 +254,60 @@ test.it("get should emit an error", async (t) => {
 	try {
 		await keyv.get("foo");
 	} catch {}
+});
+
+test.it("disconnect should work", async (t) => {
+	const memcache = new KeyvMemcache(uri);
+	await memcache.set("disconnect-test", "value");
+	await memcache.disconnect();
+	t.expect(true).toBeTruthy();
+});
+
+test.it("createKeyv returns a Keyv instance", (t) => {
+	const keyv = createKeyv(uri);
+	t.expect(keyv).toBeInstanceOf(Keyv);
+});
+
+test.it("constructor with string URI sets nodes", (t) => {
+	const m = new KeyvMemcache("myserver:11211");
+	t.expect(m.opts.nodes).toEqual(["myserver:11211"]);
+});
+
+test.it("constructor with options object containing nodes", (t) => {
+	const m = new KeyvMemcache({ nodes: ["server1:11211", "server2:11211"] });
+	t.expect(m.opts.nodes).toEqual(["server1:11211", "server2:11211"]);
+});
+
+test.it("constructor with options passes timeout to memcache client", (t) => {
+	const m = new KeyvMemcache({ nodes: [uri], timeout: 3000 });
+	t.expect(m.opts.timeout).toBe(3000);
+});
+
+test.it("constructor with options passes keepAlive to memcache client", (t) => {
+	const m = new KeyvMemcache({ nodes: [uri], keepAlive: false });
+	t.expect(m.opts.keepAlive).toBe(false);
+});
+
+test.it("constructor with options passes retries to memcache client", (t) => {
+	const m = new KeyvMemcache({ nodes: [uri], retries: 3, retryDelay: 200 });
+	t.expect(m.opts.retries).toBe(3);
+	t.expect(m.opts.retryDelay).toBe(200);
+});
+
+test.it("string URI with additional options merges correctly", (t) => {
+	const m = new KeyvMemcache(uri, { timeout: 2000 });
+	t.expect(m.opts.nodes).toEqual([uri]);
+	t.expect(m.opts.timeout).toBe(2000);
+});
+
+test.it("nodes from options takes precedence over string URI", (t) => {
+	const m = new KeyvMemcache("ignored:11211", { nodes: ["server1:11211"] });
+	t.expect(m.opts.nodes).toEqual(["server1:11211"]);
+});
+
+test.it("createKeyv with options passes them through", (t) => {
+	const keyv = createKeyv({ nodes: [uri], timeout: 3000 });
+	t.expect(keyv).toBeInstanceOf(Keyv);
 });
 
 const store = () => keyvMemcache;

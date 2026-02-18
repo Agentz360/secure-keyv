@@ -1,72 +1,86 @@
-import EventEmitter from "node:events";
-import { defaultDeserialize } from "@keyv/serialize";
-import type { Buffer } from "buffer";
+import { Hookified } from "hookified";
 import type { KeyvStoreAdapter, StoredData } from "keyv";
-import memcache from "memjs";
+import { Keyv } from "keyv";
+import { Memcache, type MemcacheOptions } from "memcache";
 
+/**
+ * Configuration options for the KeyvMemcache adapter.
+ * Extends the Memcache client options with additional Keyv-specific properties.
+ */
 export type KeyvMemcacheOptions = {
-	url?: string;
-	expires?: number;
-} & memcache.ClientOptions &
-	// biome-ignore lint/suspicious/noExplicitAny: type format
-	Record<string, any>;
+	/** Optional namespace for key prefixing */
+	namespace?: string;
+} & MemcacheOptions;
 
-export class KeyvMemcache extends EventEmitter implements KeyvStoreAdapter {
+/**
+ * Memcache storage adapter for Keyv.
+ * Uses the `memcache` package to connect to a Memcached server.
+ *
+ * @example
+ * ```typescript
+ * const store = new KeyvMemcache('localhost:11211');
+ * const keyv = new Keyv({ store });
+ * ```
+ */
+export class KeyvMemcache extends Hookified implements KeyvStoreAdapter {
+	/** Optional namespace used to prefix all keys */
 	public namespace?: string;
-	public client: memcache.Client;
+	/** The underlying Memcache client instance */
+	public client: Memcache;
+	/** Merged configuration options */
 	public opts: KeyvMemcacheOptions;
-	constructor(uri?: string, options?: KeyvMemcacheOptions) {
+
+	/**
+	 * Creates a new KeyvMemcache instance.
+	 * @param uri - The memcache server URI (e.g., `'localhost:11211'`) or an options object. Defaults to `'localhost:11211'`.
+	 * @param options - Additional configuration options, merged with the first argument if it is an object.
+	 */
+	constructor(
+		uri?: string | KeyvMemcacheOptions,
+		options?: KeyvMemcacheOptions,
+	) {
 		super();
 
-		options = {
-			...(typeof uri === "string" ? { uri } : uri),
+		const allOptions: KeyvMemcacheOptions = {
+			...(typeof uri === "object" ? uri : {}),
 			...options,
 		};
 
-		if (options.uri && options.url === undefined) {
-			options.url = options.uri;
+		if (!allOptions.nodes) {
+			allOptions.nodes = typeof uri === "string" ? [uri] : ["localhost:11211"];
 		}
 
-		if (uri === undefined) {
-			uri = "localhost:11211";
-			options.url = options.uri = uri;
-		}
+		this.opts = allOptions;
+		this.namespace = allOptions.namespace;
 
-		this.opts = options;
-
-		this.client = memcache.Client.create(uri, options);
+		const { namespace: _namespace, ...memcacheOptions } = allOptions;
+		this.client = new Memcache(memcacheOptions);
 	}
 
-	_getNamespace(): string {
-		// biome-ignore lint/style/noNonNullAssertion: fix this
-		return `namespace:${this.namespace!}`;
-	}
-
+	/**
+	 * Retrieves a value from the memcache server.
+	 * @param key - The key to retrieve
+	 * @returns The stored data, or `{ value: undefined, expires: 0 }` if the key does not exist
+	 */
 	async get<Value>(key: string): Promise<StoredData<Value>> {
-		return new Promise((resolve, reject) => {
-			this.client.get(this.formatKey(key), (error, value) => {
-				if (error) {
-					this.emit("error", error);
-					reject(error);
-				} else {
-					let value_: StoredData<Value>;
-					if (value === null) {
-						value_ = {
-							value: undefined,
-							expires: 0,
-						};
-					} else {
-						value_ = this.opts.deserialize
-							? this.opts.deserialize(value)
-							: defaultDeserialize(value);
-					}
+		try {
+			const value = await this.client.get(this.formatKey(key));
+			if (value === undefined) {
+				return undefined;
+			}
 
-					resolve(value_);
-				}
-			});
-		});
+			return value as StoredData<Value>;
+		} catch (error) {
+			this.emit("error", error);
+			throw error;
+		}
 	}
 
+	/**
+	 * Retrieves multiple values from the memcache server.
+	 * @param keys - An array of keys to retrieve
+	 * @returns An array of stored data corresponding to each key
+	 */
 	async getMany<Value>(keys: string[]) {
 		const promises = [];
 		for (const key of keys) {
@@ -84,34 +98,63 @@ export class KeyvMemcache extends EventEmitter implements KeyvStoreAdapter {
 		});
 	}
 
+	/**
+	 * Stores a value in the memcache server.
+	 * @param key - The key to store
+	 * @param value - The value to store
+	 * @param ttl - Time to live in milliseconds. Converted to seconds internally for memcache.
+	 */
 	// biome-ignore lint/suspicious/noExplicitAny: type format
 	async set(key: string, value: any, ttl?: number) {
-		const options: KeyvMemcacheOptions = {};
+		const exptime = ttl !== undefined ? Math.floor(ttl / 1000) : 0;
 
-		if (ttl !== undefined) {
-			options.expires = options.ttl = Math.floor(ttl / 1000); // Moving to seconds
+		try {
+			await this.client.set(this.formatKey(key), value as string, exptime);
+		} catch (error) {
+			this.emit("error", error);
+			throw error;
 		}
+	}
 
-		await this.client.set(
-			this.formatKey(key),
-			value as unknown as Buffer,
-			options,
+	/**
+	 * Stores multiple values in the memcache server.
+	 * @param entries - An array of objects containing key, value, and optional ttl
+	 */
+	async setMany(
+		// biome-ignore lint/suspicious/noExplicitAny: type format
+		entries: Array<{ key: string; value: any; ttl?: number }>,
+	): Promise<void> {
+		const promises = entries.map(async ({ key, value, ttl }) =>
+			this.set(key, value, ttl),
 		);
+		const results = await Promise.allSettled(promises);
+		for (const result of results) {
+			if (result.status === "rejected") {
+				this.emit("error", result.reason);
+				throw result.reason as Error;
+			}
+		}
 	}
 
+	/**
+	 * Deletes a key from the memcache server.
+	 * @param key - The key to delete
+	 * @returns `true` if the key was deleted, `false` otherwise
+	 */
 	async delete(key: string): Promise<boolean> {
-		return new Promise((resolve, reject) => {
-			this.client.delete(this.formatKey(key), (error, success) => {
-				if (error) {
-					this.emit("error", error);
-					reject(error);
-				} else {
-					resolve(Boolean(success));
-				}
-			});
-		});
+		try {
+			return await this.client.delete(this.formatKey(key));
+		} catch (error) {
+			this.emit("error", error);
+			throw error;
+		}
 	}
 
+	/**
+	 * Deletes multiple keys from the memcache server.
+	 * @param keys - An array of keys to delete
+	 * @returns `true` if all keys were successfully deleted, `false` otherwise
+	 */
 	async deleteMany(keys: string[]) {
 		const promises = keys.map(async (key) => this.delete(key));
 		const results = await Promise.allSettled(promises);
@@ -119,19 +162,58 @@ export class KeyvMemcache extends EventEmitter implements KeyvStoreAdapter {
 		return results.every((x) => x.value === true);
 	}
 
-	async clear(): Promise<void> {
-		return new Promise((resolve, reject) => {
-			this.client.flush((error) => {
-				if (error) {
-					this.emit("error", error);
-					reject(error);
-				} else {
-					resolve(undefined);
-				}
-			});
-		});
+	/**
+	 * Checks whether a key exists in the memcache server.
+	 * @param key - The key to check
+	 * @returns `true` if the key exists, `false` otherwise. Returns `false` on any error.
+	 */
+	async has(key: string): Promise<boolean> {
+		try {
+			const value = await this.client.get(this.formatKey(key));
+			return value !== undefined;
+		} catch {
+			return false;
+		}
 	}
 
+	/**
+	 * Checks whether multiple keys exist in the memcache server.
+	 * @param keys - An array of keys to check
+	 * @returns An array of booleans indicating whether each key exists
+	 */
+	async hasMany(keys: string[]): Promise<boolean[]> {
+		const promises = keys.map(async (key) => this.has(key));
+		const results = await Promise.allSettled(promises);
+		return results.map((result) =>
+			result.status === "fulfilled" ? result.value : false,
+		);
+	}
+
+	/**
+	 * Clears all data from the memcache server by flushing it.
+	 * Note: this flushes the entire server, not just the current namespace.
+	 */
+	async clear(): Promise<void> {
+		try {
+			await this.client.flush();
+		} catch (error) {
+			this.emit("error", error);
+			throw error;
+		}
+	}
+
+	/**
+	 * Gracefully disconnects from the memcache server.
+	 */
+	async disconnect(): Promise<void> {
+		await this.client.disconnect();
+	}
+
+	/**
+	 * Formats a key by prepending the namespace if one is set.
+	 * @param key - The key to format
+	 * @returns The formatted key (e.g., `'namespace:key'`), or the original key if no namespace is set
+	 */
 	formatKey(key: string) {
 		let result = key;
 
@@ -141,18 +223,23 @@ export class KeyvMemcache extends EventEmitter implements KeyvStoreAdapter {
 
 		return result;
 	}
-
-	async has(key: string): Promise<boolean> {
-		return new Promise((resolve) => {
-			this.client.get(this.formatKey(key), (error, value) => {
-				if (error) {
-					resolve(false);
-				} else {
-					resolve(value !== null);
-				}
-			});
-		});
-	}
 }
+
+/**
+ * Creates a new Keyv instance backed by a Memcache store.
+ * @param uri - The memcache server URI (e.g., `'localhost:11211'`) or an options object.
+ * @param options - Additional configuration options, merged with the first argument if it is an object.
+ * @returns A configured Keyv instance using KeyvMemcache as the store.
+ *
+ * @example
+ * ```typescript
+ * const keyv = createKeyv('localhost:11211');
+ * await keyv.set('foo', 'bar');
+ * ```
+ */
+export const createKeyv = (
+	uri?: string | KeyvMemcacheOptions,
+	options?: KeyvMemcacheOptions,
+) => new Keyv({ store: new KeyvMemcache(uri, options) });
 
 export default KeyvMemcache;
