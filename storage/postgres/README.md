@@ -26,6 +26,7 @@ Requires Postgres 9.5 or newer for `ON CONFLICT` support to allow performant ups
   - [ssl](#ssl)
   - [iterationLimit](#iterationlimit)
   - [useUnloggedTable](#useunloggedtable)
+  - [clearExpiredInterval](#clearexpiredinterval)
   - [namespace](#namespace)
 - [Methods](#methods)
   - [.set(key, value)](#setkey-value)
@@ -37,6 +38,7 @@ Requires Postgres 9.5 or newer for `ON CONFLICT` support to allow performant ups
   - [.delete(key)](#deletekey)
   - [.deleteMany(keys)](#deletemanykeys)
   - [.clear()](#clear)
+  - [.clearExpired()](#clearexpired)
   - [.iterator(namespace?)](#iteratornamespace)
   - [.disconnect()](#disconnect)
 - [Using an Unlogged Table for Performance](#using-an-unlogged-table-for-performance)
@@ -78,7 +80,9 @@ const keyv = createKeyv({ uri: 'postgresql://user:pass@localhost:5432/dbname', t
 
 # Migrating to v6
 
-## Properties instead of opts
+## Breaking changes
+
+### Properties instead of opts
 
 In v5, configuration was accessed through the `opts` object:
 
@@ -97,11 +101,67 @@ store.schema; // 'public'
 store.table = 'cache';
 ```
 
-## Native namespace support
+The `opts` getter still exists for backward compatibility but should not be used for new code.
+
+### Native namespace support
 
 In v5, namespaces were stored as key prefixes in the `key` column (e.g. `key="myns:mykey"` with `namespace=NULL`). In v6, the namespace is stored in a dedicated `namespace` column (e.g. `key="mykey"`, `namespace="myns"`). This enables more efficient queries and proper namespace isolation.
 
 The adapter automatically adds the `namespace` column and creates the appropriate index when it connects, so no manual schema changes are needed for new installations.
+
+### Hookified integration
+
+The adapter now extends [Hookified](https://hookified.org) instead of a custom EventEmitter. Events work the same (`on`, `emit`), but hooks are also available via the standard Hookified API.
+
+## New features
+
+### Native TTL support with `expires` column
+
+v6 adds an `expires BIGINT` column to the table. When values are stored with a TTL via Keyv core, the adapter automatically extracts the `expires` timestamp from the serialized value and stores it in the column. A partial index is created on the `expires` column for efficient cleanup queries.
+
+The schema migration is automatic on connect — existing tables get the column added via `ADD COLUMN IF NOT EXISTS`.
+
+### `clearExpired()` method
+
+A new utility method that deletes all rows where the `expires` column is set and the timestamp is in the past:
+
+```js
+await store.clearExpired();
+```
+
+### `clearExpiredInterval` option
+
+Set an interval (in milliseconds) to automatically call `clearExpired()` on a schedule. Disabled by default (`0`). The timer uses `unref()` so it won't keep the Node.js process alive.
+
+```js
+const store = new KeyvPostgres({
+  uri: 'postgresql://user:pass@localhost:5432/dbname',
+  clearExpiredInterval: 60_000, // clean up every 60 seconds
+});
+```
+
+### Bulk operations
+
+New methods for efficient multi-key operations:
+
+- `.setMany(entries)` — bulk upsert using PostgreSQL `UNNEST`
+- `.getMany(keys)` — bulk retrieve using `ANY`
+- `.deleteMany(keys)` — bulk delete using `ANY`
+- `.hasMany(keys)` — bulk existence check
+
+### `createKeyv()` helper
+
+A convenience function to create a `Keyv` instance with `KeyvPostgres` as the store in one call:
+
+```js
+import { createKeyv } from '@keyv/postgres';
+
+const keyv = createKeyv({ uri: 'postgresql://user:pass@localhost:5432/dbname' });
+```
+
+### Improved iterator
+
+The iterator now uses cursor-based (keyset) pagination instead of `OFFSET`. This handles concurrent deletions during iteration without skipping entries and is more efficient for large datasets.
 
 ## Running the migration script
 
@@ -146,6 +206,7 @@ The migration runs inside a transaction and will roll back automatically if anyt
 | `ssl` | `object` | `undefined` | SSL/TLS configuration passed to the `pg` driver |
 | `iterationLimit` | `number` | `10` | Number of rows fetched per batch during iteration |
 | `useUnloggedTable` | `boolean` | `false` | Use a PostgreSQL UNLOGGED table for better write performance |
+| `clearExpiredInterval` | `number` | `0` | Interval in milliseconds to automatically clear expired entries (0 = disabled) |
 
 # Properties
 
@@ -251,6 +312,22 @@ const store = new KeyvPostgres({ uri: 'postgresql://user:pass@localhost:5432/dbn
 console.log(store.useUnloggedTable); // true
 ```
 
+## clearExpiredInterval
+
+Get or set the interval in milliseconds between automatic expired-entry cleanup runs. When set to a value greater than 0, the adapter will automatically call `clearExpired()` at the specified interval. The timer uses `unref()` so it won't keep the Node.js process alive. Setting to 0 disables the automatic cleanup.
+
+- Type: `number`
+- Default: `0` (disabled)
+
+```js
+// Clean up expired entries every 60 seconds
+const store = new KeyvPostgres({ uri: 'postgresql://user:pass@localhost:5432/dbname', clearExpiredInterval: 60_000 });
+console.log(store.clearExpiredInterval); // 60000
+
+// Disable it later
+store.clearExpiredInterval = 0;
+```
+
 ## namespace
 
 Get or set the namespace for the adapter. Used for key prefixing and scoping operations like `clear()`.
@@ -342,6 +419,14 @@ Clear all keys in the current namespace.
 
 ```js
 await keyv.clear();
+```
+
+## .clearExpired()
+
+Utility helper method to delete all expired entries from the store. This removes any rows where the `expires` column is set and the timestamp is in the past. This is useful for periodic cleanup of expired data.
+
+```js
+await keyv.clearExpired();
 ```
 
 ## .iterator(namespace?)

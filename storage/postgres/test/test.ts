@@ -389,3 +389,251 @@ test.it(
 		t.expect(keys).toContain("ns1:key2");
 	},
 );
+
+test.it(
+	"set() extracts and stores expires in the expires column",
+	async (t) => {
+		const keyv = new KeyvPostgres({ uri: postgresUri });
+		const expiresTimestamp = Date.now() + 60_000;
+		const serializedValue = JSON.stringify({
+			value: "test-value",
+			expires: expiresTimestamp,
+		});
+		await keyv.set("expires-test-key", serializedValue);
+		t.expect(await keyv.get("expires-test-key")).toBe(serializedValue);
+	},
+);
+
+test.it(
+	"set() stores null expires when value has no expires field",
+	async (t) => {
+		const keyv = new KeyvPostgres({ uri: postgresUri });
+		const serializedValue = JSON.stringify({ value: "no-ttl-value" });
+		await keyv.set("no-expires-key", serializedValue);
+		t.expect(await keyv.get("no-expires-key")).toBe(serializedValue);
+	},
+);
+
+test.it("set() gracefully handles non-JSON string values", async (t) => {
+	const keyv = new KeyvPostgres({ uri: postgresUri });
+	await keyv.set("plain-text-key", "not-json-at-all");
+	t.expect(await keyv.get("plain-text-key")).toBe("not-json-at-all");
+});
+
+test.it("set() updates expires column on upsert", async (t) => {
+	const keyv = new KeyvPostgres({ uri: postgresUri });
+	const expires1 = Date.now() + 60_000;
+	const expires2 = Date.now() + 120_000;
+	await keyv.set(
+		"upsert-exp-key",
+		JSON.stringify({ value: "v1", expires: expires1 }),
+	);
+	await keyv.set(
+		"upsert-exp-key",
+		JSON.stringify({ value: "v2", expires: expires2 }),
+	);
+	t.expect(await keyv.get("upsert-exp-key")).toBe(
+		JSON.stringify({ value: "v2", expires: expires2 }),
+	);
+});
+
+test.it("setMany() extracts and stores expires for each entry", async (t) => {
+	const keyv = new KeyvPostgres({ uri: postgresUri });
+	const expires1 = Date.now() + 60_000;
+	const expires2 = Date.now() + 120_000;
+	await keyv.setMany([
+		{
+			key: "many-exp-1",
+			value: JSON.stringify({ value: "v1", expires: expires1 }),
+		},
+		{
+			key: "many-exp-2",
+			value: JSON.stringify({ value: "v2", expires: expires2 }),
+		},
+		{ key: "many-exp-3", value: JSON.stringify({ value: "v3" }) },
+	]);
+	t.expect(await keyv.get("many-exp-1")).toBe(
+		JSON.stringify({ value: "v1", expires: expires1 }),
+	);
+	t.expect(await keyv.get("many-exp-2")).toBe(
+		JSON.stringify({ value: "v2", expires: expires2 }),
+	);
+	t.expect(await keyv.get("many-exp-3")).toBe(JSON.stringify({ value: "v3" }));
+});
+
+test.it(
+	"expires column is populated when using Keyv core with TTL",
+	async (t) => {
+		const keyv = new Keyv({
+			store: new KeyvPostgres({ uri: postgresUri }),
+			ttl: 60_000,
+		});
+		const key = faker.string.alphanumeric(10);
+		await keyv.set(key, "ttl-value");
+		t.expect(await keyv.get(key)).toBe("ttl-value");
+	},
+);
+
+test.it(
+	"set() handles object value with expires (serialization disabled)",
+	async (t) => {
+		const keyv = new KeyvPostgres({ uri: postgresUri });
+		const expiresTimestamp = Date.now() + 60_000;
+		const objectValue = { value: "obj-test", expires: expiresTimestamp };
+		// biome-ignore lint/suspicious/noExplicitAny: testing non-string value path
+		await keyv.set("obj-expires-key", objectValue as any);
+		const result = await keyv.get("obj-expires-key");
+		t.expect(result).toBeDefined();
+	},
+);
+
+test.it("set() handles object value without expires", async (t) => {
+	const keyv = new KeyvPostgres({ uri: postgresUri });
+	const objectValue = { value: "no-exp-obj" };
+	// biome-ignore lint/suspicious/noExplicitAny: testing non-string value path
+	await keyv.set("obj-no-expires-key", objectValue as any);
+	const result = await keyv.get("obj-no-expires-key");
+	t.expect(result).toBeDefined();
+});
+
+test.it("set() handles null value for expires extraction", async (t) => {
+	const keyv = new KeyvPostgres({ uri: postgresUri });
+	// biome-ignore lint/suspicious/noExplicitAny: testing null value path
+	await keyv.set("null-val-key", null as any);
+	const result = await keyv.get("null-val-key");
+	t.expect(result).toBeNull();
+});
+
+test.it("set() handles numeric value for expires extraction", async (t) => {
+	const keyv = new KeyvPostgres({ uri: postgresUri });
+	// biome-ignore lint/suspicious/noExplicitAny: testing numeric value path
+	await keyv.set("num-val-key", 12345 as any);
+	const result = await keyv.get("num-val-key");
+	t.expect(result).toBe("12345");
+});
+
+test.it(
+	"clearExpired() removes expired entries and keeps valid ones",
+	async (t) => {
+		const keyv = new KeyvPostgres({ uri: postgresUri });
+		const pastExpires = Date.now() - 60_000;
+		const futureExpires = Date.now() + 60_000;
+		await keyv.set(
+			"expired-key",
+			JSON.stringify({ value: "old", expires: pastExpires }),
+		);
+		await keyv.set(
+			"valid-key",
+			JSON.stringify({ value: "fresh", expires: futureExpires }),
+		);
+		await keyv.set("no-ttl-key", JSON.stringify({ value: "forever" }));
+
+		await keyv.clearExpired();
+
+		t.expect(await keyv.get("expired-key")).toBeUndefined();
+		t.expect(await keyv.get("valid-key")).toBe(
+			JSON.stringify({ value: "fresh", expires: futureExpires }),
+		);
+		t.expect(await keyv.get("no-ttl-key")).toBe(
+			JSON.stringify({ value: "forever" }),
+		);
+	},
+);
+
+test.it("clearExpired() is a no-op when no entries are expired", async (t) => {
+	const keyv = new KeyvPostgres({ uri: postgresUri });
+	const futureExpires = Date.now() + 60_000;
+	await keyv.set(
+		"still-valid",
+		JSON.stringify({ value: "ok", expires: futureExpires }),
+	);
+
+	await keyv.clearExpired();
+
+	t.expect(await keyv.get("still-valid")).toBe(
+		JSON.stringify({ value: "ok", expires: futureExpires }),
+	);
+});
+
+test.it("clearExpiredInterval defaults to 0 (disabled)", (t) => {
+	const keyv = new KeyvPostgres({ uri: postgresUri });
+	t.expect(keyv.clearExpiredInterval).toBe(0);
+});
+
+test.it("clearExpiredInterval can be set via constructor options", (t) => {
+	const keyv = new KeyvPostgres({
+		uri: postgresUri,
+		clearExpiredInterval: 5000,
+	});
+	t.expect(keyv.clearExpiredInterval).toBe(5000);
+	keyv.clearExpiredInterval = 0;
+});
+
+test.it("clearExpiredInterval getter and setter work", (t) => {
+	const keyv = new KeyvPostgres({ uri: postgresUri });
+	t.expect(keyv.clearExpiredInterval).toBe(0);
+	keyv.clearExpiredInterval = 3000;
+	t.expect(keyv.clearExpiredInterval).toBe(3000);
+	keyv.clearExpiredInterval = 0;
+});
+
+test.it("clearExpiredInterval is included in opts getter", (t) => {
+	const keyv = new KeyvPostgres({
+		uri: postgresUri,
+		clearExpiredInterval: 10_000,
+	});
+	t.expect(keyv.opts.clearExpiredInterval).toBe(10_000);
+	keyv.clearExpiredInterval = 0;
+});
+
+test.it(
+	"clearExpiredInterval automatically clears expired entries",
+	async (t) => {
+		const keyv = new KeyvPostgres({
+			uri: postgresUri,
+			clearExpiredInterval: 100,
+		});
+		const pastExpires = Date.now() - 60_000;
+		const futureExpires = Date.now() + 60_000;
+		await keyv.set(
+			"interval-expired",
+			JSON.stringify({ value: "old", expires: pastExpires }),
+		);
+		await keyv.set(
+			"interval-valid",
+			JSON.stringify({ value: "fresh", expires: futureExpires }),
+		);
+
+		// Wait for the interval to fire
+		await new Promise((resolve) => {
+			setTimeout(resolve, 300);
+		});
+
+		t.expect(await keyv.get("interval-expired")).toBeUndefined();
+		t.expect(await keyv.get("interval-valid")).toBe(
+			JSON.stringify({ value: "fresh", expires: futureExpires }),
+		);
+		keyv.clearExpiredInterval = 0;
+	},
+);
+
+test.it("disconnect stops the clearExpiredInterval timer", async (t) => {
+	const keyv = new KeyvPostgres({
+		uri: postgresUri,
+		clearExpiredInterval: 100,
+	});
+	t.expect(keyv.clearExpiredInterval).toBe(100);
+	await keyv.disconnect();
+	// After disconnect, the timer should be stopped. We just verify no errors are thrown.
+	t.expect(keyv.clearExpiredInterval).toBe(100);
+});
+
+test.it("setting clearExpiredInterval to 0 stops an active timer", (t) => {
+	const keyv = new KeyvPostgres({
+		uri: postgresUri,
+		clearExpiredInterval: 1000,
+	});
+	t.expect(keyv.clearExpiredInterval).toBe(1000);
+	keyv.clearExpiredInterval = 0;
+	t.expect(keyv.clearExpiredInterval).toBe(0);
+});

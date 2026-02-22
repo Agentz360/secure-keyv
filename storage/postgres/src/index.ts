@@ -78,6 +78,18 @@ export class KeyvPostgres extends Hookified implements KeyvStoreAdapter {
 	private _useUnloggedTable = false;
 
 	/**
+	 * The interval in milliseconds between automatic expired-entry cleanup runs.
+	 * A value of 0 (default) disables the automatic cleanup.
+	 * @default 0
+	 */
+	private _clearExpiredInterval = 0;
+
+	/**
+	 * The timer reference for the automatic expired-entry cleanup interval.
+	 */
+	private _clearExpiredTimer?: ReturnType<typeof setInterval>;
+
+	/**
 	 * Additional PoolConfig properties passed through to the pg connection pool.
 	 */
 	private _poolConfig: PoolConfig = {};
@@ -98,17 +110,26 @@ export class KeyvPostgres extends Hookified implements KeyvStoreAdapter {
 		const schemaEsc = escapeIdentifier(this._schema);
 		const tableEsc = escapeIdentifier(this._table);
 
-		let createTable = `CREATE${this._useUnloggedTable ? " UNLOGGED " : " "}TABLE IF NOT EXISTS ${schemaEsc}.${tableEsc}(key VARCHAR(${Number(this._keyLength)}) NOT NULL, value TEXT, namespace VARCHAR(${Number(this._namespaceLength)}) DEFAULT NULL)`;
+		let createTable = `CREATE${this._useUnloggedTable ? " UNLOGGED " : " "}TABLE IF NOT EXISTS ${schemaEsc}.${tableEsc}(key VARCHAR(${Number(this._keyLength)}) NOT NULL, value TEXT, namespace VARCHAR(${Number(this._namespaceLength)}) DEFAULT NULL, expires BIGINT DEFAULT NULL)`;
 
 		if (this._schema !== "public") {
 			createTable = `CREATE SCHEMA IF NOT EXISTS ${schemaEsc}; ${createTable}`;
 		}
 
 		const migration = `ALTER TABLE ${schemaEsc}.${tableEsc} ADD COLUMN IF NOT EXISTS namespace VARCHAR(${Number(this._namespaceLength)}) DEFAULT NULL`;
+		const migrationExpires = `ALTER TABLE ${schemaEsc}.${tableEsc} ADD COLUMN IF NOT EXISTS expires BIGINT DEFAULT NULL`;
 		const dropOldPk = `ALTER TABLE ${schemaEsc}.${tableEsc} DROP CONSTRAINT IF EXISTS ${escapeIdentifier(`${this._table}_pkey`)}`;
 		const createIndex = `CREATE UNIQUE INDEX IF NOT EXISTS ${escapeIdentifier(`${this._table}_key_namespace_idx`)} ON ${schemaEsc}.${tableEsc} (key, COALESCE(namespace, ''))`;
+		const createExpiresIndex = `CREATE INDEX IF NOT EXISTS ${escapeIdentifier(`${this._table}_expires_idx`)} ON ${schemaEsc}.${tableEsc} (expires) WHERE expires IS NOT NULL`;
 
-		this._connected = this.init(createTable, migration, dropOldPk, createIndex)
+		this._connected = this.init(
+			createTable,
+			migration,
+			migrationExpires,
+			dropOldPk,
+			createIndex,
+			createExpiresIndex,
+		)
 			/* v8 ignore start -- @preserve */
 			.catch((error) => {
 				this.emit("error", error);
@@ -121,6 +142,8 @@ export class KeyvPostgres extends Hookified implements KeyvStoreAdapter {
 			const query = await this._connected;
 			return query(sqlString, values);
 		};
+
+		this.startClearExpiredTimer();
 	}
 
 	/**
@@ -130,16 +153,20 @@ export class KeyvPostgres extends Hookified implements KeyvStoreAdapter {
 	private async init(
 		createTable: string,
 		migration: string,
+		migrationExpires: string,
 		dropOldPk: string,
 		createIndex: string,
+		createExpiresIndex: string,
 	): Promise<Query> {
 		const query = await this.connect();
 
 		try {
 			await query(createTable);
 			await query(migration);
+			await query(migrationExpires);
 			await query(dropOldPk);
 			await query(createIndex);
+			await query(createExpiresIndex);
 		} catch (error) {
 			// 23505 = unique_violation: safe to ignore when concurrent instances
 			// race to create the same index (the index already exists).
@@ -287,6 +314,24 @@ export class KeyvPostgres extends Hookified implements KeyvStoreAdapter {
 	}
 
 	/**
+	 * Get the interval in milliseconds between automatic expired-entry cleanup runs.
+	 * A value of 0 means the automatic cleanup is disabled.
+	 * @default 0
+	 */
+	public get clearExpiredInterval(): number {
+		return this._clearExpiredInterval;
+	}
+
+	/**
+	 * Set the interval in milliseconds between automatic expired-entry cleanup runs.
+	 * Setting to 0 disables the automatic cleanup.
+	 */
+	public set clearExpiredInterval(value: number) {
+		this._clearExpiredInterval = value;
+		this.startClearExpiredTimer();
+	}
+
+	/**
 	 * Get the options for the adapter. This is required by the KeyvStoreAdapter interface.
 	 */
 	// biome-ignore lint/suspicious/noExplicitAny: type format
@@ -301,6 +346,7 @@ export class KeyvPostgres extends Hookified implements KeyvStoreAdapter {
 			dialect: "postgres",
 			iterationLimit: this._iterationLimit,
 			useUnloggedTable: this._useUnloggedTable,
+			clearExpiredInterval: this._clearExpiredInterval,
 			...this._poolConfig,
 		};
 	}
@@ -355,11 +401,17 @@ export class KeyvPostgres extends Hookified implements KeyvStoreAdapter {
 	// biome-ignore lint/suspicious/noExplicitAny: type format
 	public async set(key: string, value: any): Promise<void> {
 		const strippedKey = this.removeKeyPrefix(key);
-		const upsert = `INSERT INTO ${escapeIdentifier(this._schema)}.${escapeIdentifier(this._table)} (key, value, namespace)
-      VALUES($1, $2, $3)
+		const expires = this.getExpiresFromValue(value);
+		const upsert = `INSERT INTO ${escapeIdentifier(this._schema)}.${escapeIdentifier(this._table)} (key, value, namespace, expires)
+      VALUES($1, $2, $3, $4)
       ON CONFLICT(key, COALESCE(namespace, ''))
-      DO UPDATE SET value=excluded.value;`;
-		await this.query(upsert, [strippedKey, value, this.getNamespaceValue()]);
+      DO UPDATE SET value=excluded.value, expires=excluded.expires;`;
+		await this.query(upsert, [
+			strippedKey,
+			value,
+			this.getNamespaceValue(),
+			expires,
+		]);
 	}
 
 	/**
@@ -369,15 +421,22 @@ export class KeyvPostgres extends Hookified implements KeyvStoreAdapter {
 	public async setMany(entries: KeyvEntry[]): Promise<void> {
 		const keys = [];
 		const values = [];
+		const expiresArray: Array<number | null> = [];
 		for (const { key, value } of entries) {
 			keys.push(this.removeKeyPrefix(key));
 			values.push(value);
+			expiresArray.push(this.getExpiresFromValue(value));
 		}
-		const upsert = `INSERT INTO ${escapeIdentifier(this._schema)}.${escapeIdentifier(this._table)} (key, value, namespace)
-      SELECT k, v, $3 FROM UNNEST($1::text[], $2::text[]) AS t(k, v)
+		const upsert = `INSERT INTO ${escapeIdentifier(this._schema)}.${escapeIdentifier(this._table)} (key, value, namespace, expires)
+      SELECT k, v, $3, e FROM UNNEST($1::text[], $2::text[], $4::bigint[]) AS t(k, v, e)
       ON CONFLICT(key, COALESCE(namespace, ''))
-      DO UPDATE SET value=excluded.value;`;
-		await this.query(upsert, [keys, values, this.getNamespaceValue()]);
+      DO UPDATE SET value=excluded.value, expires=excluded.expires;`;
+		await this.query(upsert, [
+			keys,
+			values,
+			this.getNamespaceValue(),
+			expiresArray,
+		]);
 	}
 
 	/**
@@ -417,6 +476,14 @@ export class KeyvPostgres extends Hookified implements KeyvStoreAdapter {
 			const del = `DELETE FROM ${escapeIdentifier(this._schema)}.${escapeIdentifier(this._table)} WHERE namespace IS NULL`;
 			await this.query(del);
 		}
+	}
+
+	/**
+	 * Utility helper method to delete all expired entries from the store where the `expires` column is less than the current timestamp.
+	 */
+	public async clearExpired(): Promise<void> {
+		const del = `DELETE FROM ${escapeIdentifier(this._schema)}.${escapeIdentifier(this._table)} WHERE expires IS NOT NULL AND expires < $1`;
+		await this.query(del, [Date.now()]);
 	}
 
 	/**
@@ -544,8 +611,10 @@ export class KeyvPostgres extends Hookified implements KeyvStoreAdapter {
 
 	/**
 	 * Disconnects from the PostgreSQL database and releases the connection pool.
+	 * Also stops the automatic expired-entry cleanup interval if running.
 	 */
 	public async disconnect(): Promise<void> {
+		this.stopClearExpiredTimer();
 		await endPool(this._uri, { ...this._poolConfig, ssl: this._ssl });
 	}
 
@@ -566,6 +635,61 @@ export class KeyvPostgres extends Hookified implements KeyvStoreAdapter {
 	 */
 	private getNamespaceValue(): string | null {
 		return this._namespace ?? null;
+	}
+
+	/**
+	 * Extracts the `expires` timestamp from a serialized value.
+	 * The Keyv core serializes data as JSON like `{"value":"...","expires":1234567890}`.
+	 * Returns the expires value as a number, or null if not present or not parseable.
+	 */
+	// biome-ignore lint/suspicious/noExplicitAny: type format
+	private getExpiresFromValue(value: any): number | null {
+		// biome-ignore lint/suspicious/noExplicitAny: type format
+		let data: any;
+		if (typeof value === "string") {
+			try {
+				data = JSON.parse(value);
+			} catch {
+				return null;
+			}
+		} else {
+			data = value;
+		}
+
+		if (data && typeof data === "object" && typeof data.expires === "number") {
+			return data.expires;
+		}
+
+		return null;
+	}
+
+	/**
+	 * Starts (or restarts) the automatic expired-entry cleanup interval.
+	 * If the interval is 0 or negative, any existing timer is stopped.
+	 */
+	private startClearExpiredTimer(): void {
+		this.stopClearExpiredTimer();
+		if (this._clearExpiredInterval > 0) {
+			this._clearExpiredTimer = setInterval(async () => {
+				try {
+					await this.clearExpired();
+				} catch (error) {
+					/* v8 ignore next -- @preserve */
+					this.emit("error", error);
+				}
+			}, this._clearExpiredInterval);
+			this._clearExpiredTimer.unref();
+		}
+	}
+
+	/**
+	 * Stops the automatic expired-entry cleanup interval if running.
+	 */
+	private stopClearExpiredTimer(): void {
+		if (this._clearExpiredTimer) {
+			clearInterval(this._clearExpiredTimer);
+			this._clearExpiredTimer = undefined;
+		}
 	}
 
 	private setOptions(options: KeyvPostgresOptions): void {
@@ -601,6 +725,10 @@ export class KeyvPostgres extends Hookified implements KeyvStoreAdapter {
 			this._useUnloggedTable = options.useUnloggedTable;
 		}
 
+		if (options.clearExpiredInterval !== undefined) {
+			this._clearExpiredInterval = options.clearExpiredInterval;
+		}
+
 		const {
 			uri,
 			table,
@@ -610,6 +738,7 @@ export class KeyvPostgres extends Hookified implements KeyvStoreAdapter {
 			ssl,
 			iterationLimit,
 			useUnloggedTable,
+			clearExpiredInterval,
 			...poolConfigRest
 		} = options;
 
