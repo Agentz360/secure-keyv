@@ -15,20 +15,19 @@ Requires Postgres 9.5 or newer for `ON CONFLICT` support to allow performant ups
 
 - [Install](#install)
 - [Usage](#usage)
+- [Migrating to v6](#migrating-to-v6)
 - [Constructor Options](#constructor-options)
 - [Properties](#properties)
   - [uri](#uri)
   - [table](#table)
-  - [keySize](#keysize)
+  - [keyLength](#keylength)
+  - [namespaceLength](#namespacelength)
   - [schema](#schema)
   - [ssl](#ssl)
   - [iterationLimit](#iterationlimit)
   - [useUnloggedTable](#useunloggedtable)
   - [namespace](#namespace)
-- [Using an Unlogged Table for Performance](#using-an-unlogged-table-for-performance)
-- [Connection Pooling](#connection-pooling)
-- [SSL/TLS Connections](#ssltls-connections)
-- [API](#api)
+- [Methods](#methods)
   - [.set(key, value)](#setkey-value)
   - [.setMany(entries)](#setmanyentries)
   - [.get(key)](#getkey)
@@ -40,6 +39,9 @@ Requires Postgres 9.5 or newer for `ON CONFLICT` support to allow performant ups
   - [.clear()](#clear)
   - [.iterator(namespace?)](#iteratornamespace)
   - [.disconnect()](#disconnect)
+- [Using an Unlogged Table for Performance](#using-an-unlogged-table-for-performance)
+- [Connection Pooling](#connection-pooling)
+- [SSL/TLS Connections](#ssltls-connections)
 - [Testing](#testing)
 - [License](#license)
 
@@ -74,6 +76,62 @@ import { createKeyv } from '@keyv/postgres';
 const keyv = createKeyv({ uri: 'postgresql://user:pass@localhost:5432/dbname', table: 'cache', schema: 'keyv' });
 ```
 
+# Migrating to v6
+
+## Properties instead of opts
+
+In v5, configuration was accessed through the `opts` object:
+
+```js
+// v5
+store.opts.table; // 'keyv'
+store.opts.schema; // 'public'
+```
+
+In v6, all configuration options are exposed as top-level properties with getters and setters:
+
+```js
+// v6
+store.table; // 'keyv'
+store.schema; // 'public'
+store.table = 'cache';
+```
+
+## Native namespace support
+
+In v5, namespaces were stored as key prefixes in the `key` column (e.g. `key="myns:mykey"` with `namespace=NULL`). In v6, the namespace is stored in a dedicated `namespace` column (e.g. `key="mykey"`, `namespace="myns"`). This enables more efficient queries and proper namespace isolation.
+
+The adapter automatically adds the `namespace` column and creates the appropriate index when it connects, so no manual schema changes are needed for new installations.
+
+## Running the migration script
+
+If you have existing data from v5, you need to run the migration script to move namespace prefixes from keys into the new `namespace` column. The script is located at `scripts/migrate-v6.ts` in the `@keyv/postgres` package.
+
+Preview the changes first with `--dry-run`:
+
+```shell
+npx tsx scripts/migrate-v6.ts --uri postgresql://user:pass@localhost:5432/dbname --dry-run
+```
+
+Run the migration:
+
+```shell
+npx tsx scripts/migrate-v6.ts --uri postgresql://user:pass@localhost:5432/dbname
+```
+
+You can also specify a custom table, schema, and column lengths:
+
+```shell
+npx tsx scripts/migrate-v6.ts --uri postgresql://user:pass@localhost:5432/dbname --table cache --schema keyv
+npx tsx scripts/migrate-v6.ts --uri postgresql://user:pass@localhost:5432/dbname --keyLength 512 --namespaceLength 512
+```
+
+The migration runs inside a transaction and will roll back automatically if anything fails.
+
+**Important notes:**
+- The script only migrates rows where `namespace IS NULL`. Rows that already have a namespace value (e.g. from a partial earlier migration) are skipped.
+- Keys are split on the first colon — the part before becomes the namespace, the rest becomes the key. Namespaces containing colons are not supported.
+
 # Constructor Options
 
 `KeyvPostgres` accepts a connection URI string or an options object. The options object accepts the following properties along with any [`PoolConfig`](https://node-postgres.com/apis/pool) properties from the `pg` library (e.g. `max`, `idleTimeoutMillis`, `connectionTimeoutMillis`):
@@ -82,7 +140,8 @@ const keyv = createKeyv({ uri: 'postgresql://user:pass@localhost:5432/dbname', t
 | --- | --- | --- | --- |
 | `uri` | `string` | `'postgresql://localhost:5432'` | PostgreSQL connection URI |
 | `table` | `string` | `'keyv'` | Table name for key-value storage |
-| `keySize` | `number` | `255` | Maximum key column size (VARCHAR length) |
+| `keyLength` | `number` | `255` | Maximum key column length (VARCHAR length) |
+| `namespaceLength` | `number` | `255` | Maximum namespace column length (VARCHAR length) |
 | `schema` | `string` | `'public'` | PostgreSQL schema name (created automatically if it doesn't exist) |
 | `ssl` | `object` | `undefined` | SSL/TLS configuration passed to the `pg` driver |
 | `iterationLimit` | `number` | `10` | Number of rows fetched per batch during iteration |
@@ -117,16 +176,28 @@ console.log(store.table); // 'keyv'
 store.table = 'cache';
 ```
 
-## keySize
+## keyLength
 
-Get or set the maximum key size (VARCHAR length) for the key column.
+Get or set the maximum key length (VARCHAR length) for the key column.
 
 - Type: `number`
 - Default: `255`
 
 ```js
-const store = new KeyvPostgres({ uri: 'postgresql://user:pass@localhost:5432/dbname', keySize: 512 });
-console.log(store.keySize); // 512
+const store = new KeyvPostgres({ uri: 'postgresql://user:pass@localhost:5432/dbname', keyLength: 512 });
+console.log(store.keyLength); // 512
+```
+
+## namespaceLength
+
+Get or set the maximum namespace length (VARCHAR length) for the namespace column.
+
+- Type: `number`
+- Default: `255`
+
+```js
+const store = new KeyvPostgres({ uri: 'postgresql://user:pass@localhost:5432/dbname', namespaceLength: 512 });
+console.log(store.namespaceLength); // 512
 ```
 
 ## schema
@@ -193,46 +264,7 @@ store.namespace = 'my-namespace';
 console.log(store.namespace); // 'my-namespace'
 ```
 
-# Using an Unlogged Table for Performance
-
-By default, the adapter creates a logged table. If you want to use an unlogged table for performance, you can pass the `useUnloggedTable` option to the constructor.
-
-```js
-const keyvPostgres = new KeyvPostgres({ uri: 'postgresql://user:pass@localhost:5432/dbname', useUnloggedTable: true });
-const keyv = new Keyv({ store: keyvPostgres });
-```
-
-From the [PostgreSQL documentation](https://www.postgresql.org/docs/current/sql-createtable.html#SQL-CREATETABLE-UNLOGGED):
-
-If specified, the table is created as an unlogged table. Data written to unlogged tables is not written to the write-ahead log (see Chapter 28), which makes them considerably faster than ordinary tables. However, they are not crash-safe: an unlogged table is automatically truncated after a crash or unclean shutdown. The contents of an unlogged table are also not replicated to standby servers. Any indexes created on an unlogged table are automatically unlogged as well.
-
-If this is specified, any sequences created together with the unlogged table (for identity or serial columns) are also created as unlogged.
-
-# Connection Pooling
-
-The adapter automatically uses the default settings on the `pg` package for connection pooling. You can override these settings by passing the options to the constructor such as setting the `max` pool size.
-
-```js
-const keyv = new Keyv({ store: new KeyvPostgres({ uri: 'postgresql://user:pass@localhost:5432/dbname', max: 20 }) });
-```
-
-# SSL/TLS Connections
-
-You can configure SSL/TLS connections by passing the `ssl` option. This is passed directly to the underlying `pg` driver.
-
-```js
-const keyvPostgres = new KeyvPostgres({
-  uri: 'postgresql://user:pass@localhost:5432/dbname',
-  ssl: {
-    rejectUnauthorized: false,
-  },
-});
-const keyv = new Keyv({ store: keyvPostgres });
-```
-
-For more details on SSL configuration, see the [node-postgres SSL documentation](https://node-postgres.com/features/ssl).
-
-# API
+# Methods
 
 ## .set(key, value)
 
@@ -330,6 +362,45 @@ Disconnect from the PostgreSQL database and release the connection pool.
 ```js
 await keyv.disconnect();
 ```
+
+# Using an Unlogged Table for Performance
+
+By default, the adapter creates a logged table. If you want to use an unlogged table for performance, you can pass the `useUnloggedTable` option to the constructor.
+
+```js
+const keyvPostgres = new KeyvPostgres({ uri: 'postgresql://user:pass@localhost:5432/dbname', useUnloggedTable: true });
+const keyv = new Keyv({ store: keyvPostgres });
+```
+
+From the [PostgreSQL documentation](https://www.postgresql.org/docs/current/sql-createtable.html#SQL-CREATETABLE-UNLOGGED):
+
+If specified, the table is created as an unlogged table. Data written to unlogged tables is not written to the write-ahead log (see Chapter 28), which makes them considerably faster than ordinary tables. However, they are not crash-safe: an unlogged table is automatically truncated after a crash or unclean shutdown. The contents of an unlogged table are also not replicated to standby servers. Any indexes created on an unlogged table are automatically unlogged as well.
+
+If this is specified, any sequences created together with the unlogged table (for identity or serial columns) are also created as unlogged.
+
+# Connection Pooling
+
+The adapter automatically uses the default settings on the `pg` package for connection pooling. You can override these settings by passing the options to the constructor such as setting the `max` pool size.
+
+```js
+const keyv = new Keyv({ store: new KeyvPostgres({ uri: 'postgresql://user:pass@localhost:5432/dbname', max: 20 }) });
+```
+
+# SSL/TLS Connections
+
+You can configure SSL/TLS connections by passing the `ssl` option. This is passed directly to the underlying `pg` driver.
+
+```js
+const keyvPostgres = new KeyvPostgres({
+  uri: 'postgresql://user:pass@localhost:5432/dbname',
+  ssl: {
+    rejectUnauthorized: false,
+  },
+});
+const keyv = new Keyv({ store: keyvPostgres });
+```
+
+For more details on SSL configuration, see the [node-postgres SSL documentation](https://node-postgres.com/features/ssl).
 
 # Testing
 

@@ -1,10 +1,11 @@
+import type { ConnectionOptions } from "node:tls";
 import type { PoolConfig } from "pg";
-import type { ConnectionOptions } from "tls";
 
 export type KeyvPostgresOptions = {
 	uri?: string;
 	table?: string;
-	keySize?: number;
+	keyLength?: number;
+	namespaceLength?: number;
 	schema?: string;
 	ssl?: boolean | ConnectionOptions;
 	iterationLimit?: number;

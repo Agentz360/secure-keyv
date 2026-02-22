@@ -184,7 +184,8 @@ test.it("should have correct default property values", (t) => {
 	const keyv = new KeyvPostgres();
 	t.expect(keyv.uri).toBe("postgresql://localhost:5432");
 	t.expect(keyv.table).toBe("keyv");
-	t.expect(keyv.keySize).toBe(255);
+	t.expect(keyv.keyLength).toBe(255);
+	t.expect(keyv.namespaceLength).toBe(255);
 	t.expect(keyv.schema).toBe("public");
 	t.expect(keyv.iterationLimit).toBe(10);
 	t.expect(keyv.useUnloggedTable).toBe(false);
@@ -196,7 +197,8 @@ test.it("should set properties from constructor options", (t) => {
 	const keyv = new KeyvPostgres({
 		uri: postgresUri,
 		table: "custom_table",
-		keySize: 512,
+		keyLength: 512,
+		namespaceLength: 512,
 		schema: "custom_schema",
 		iterationLimit: 50,
 		useUnloggedTable: true,
@@ -204,7 +206,8 @@ test.it("should set properties from constructor options", (t) => {
 	});
 	t.expect(keyv.uri).toBe(postgresUri);
 	t.expect(keyv.table).toBe("custom_table");
-	t.expect(keyv.keySize).toBe(512);
+	t.expect(keyv.keyLength).toBe(512);
+	t.expect(keyv.namespaceLength).toBe(512);
 	t.expect(keyv.schema).toBe("custom_schema");
 	t.expect(keyv.iterationLimit).toBe(50);
 	t.expect(keyv.useUnloggedTable).toBe(true);
@@ -224,8 +227,10 @@ test.it("should be able to get and set individual properties", (t) => {
 	t.expect(keyv.table).toBe("new_table");
 	keyv.schema = "new_schema";
 	t.expect(keyv.schema).toBe("new_schema");
-	keyv.keySize = 512;
-	t.expect(keyv.keySize).toBe(512);
+	keyv.keyLength = 512;
+	t.expect(keyv.keyLength).toBe(512);
+	keyv.namespaceLength = 512;
+	t.expect(keyv.namespaceLength).toBe(512);
 	keyv.iterationLimit = 25;
 	t.expect(keyv.iterationLimit).toBe(25);
 	keyv.useUnloggedTable = true;
@@ -252,7 +257,7 @@ test.it("opts getter should return correct object", (t) => {
 	t.expect(opts.dialect).toBe("postgres");
 	t.expect(opts.uri).toBe(postgresUri);
 	t.expect(opts.schema).toBe("public");
-	t.expect(opts.keySize).toBe(255);
+	t.expect(opts.keyLength).toBe(255);
 	t.expect(opts.useUnloggedTable).toBe(false);
 });
 
@@ -261,11 +266,11 @@ test.it("opts setter should update individual properties", (t) => {
 	keyv.opts = {
 		table: "updated_table",
 		schema: "updated_schema",
-		keySize: 1024,
+		keyLength: 1024,
 	};
 	t.expect(keyv.table).toBe("updated_table");
 	t.expect(keyv.schema).toBe("updated_schema");
-	t.expect(keyv.keySize).toBe(1024);
+	t.expect(keyv.keyLength).toBe(1024);
 	t.expect(keyv.uri).toBe(postgresUri);
 });
 
@@ -280,3 +285,107 @@ test.it("emits error when connection fails", async (t) => {
 
 	t.expect(error).toBeInstanceOf(Error);
 });
+
+test.it(
+	"native namespace: same key in different namespaces stored independently",
+	async (t) => {
+		const postgres1 = new KeyvPostgres({ uri: postgresUri });
+		postgres1.namespace = "ns1";
+		const postgres2 = new KeyvPostgres({ uri: postgresUri });
+		postgres2.namespace = "ns2";
+
+		await postgres1.set("ns1:testkey", "value1");
+		await postgres2.set("ns2:testkey", "value2");
+
+		t.expect(await postgres1.get("ns1:testkey")).toBe("value1");
+		t.expect(await postgres2.get("ns2:testkey")).toBe("value2");
+	},
+);
+
+test.it(
+	"native namespace: null namespace stores and retrieves correctly",
+	async (t) => {
+		const postgres = new KeyvPostgres({ uri: postgresUri });
+		await postgres.set("testkey", "testvalue");
+		t.expect(await postgres.get("testkey")).toBe("testvalue");
+	},
+);
+
+test.it(
+	"native namespace: clear only clears the specified namespace",
+	async (t) => {
+		const postgres1 = new KeyvPostgres({ uri: postgresUri });
+		postgres1.namespace = "ns1";
+		const postgres2 = new KeyvPostgres({ uri: postgresUri });
+		postgres2.namespace = "ns2";
+
+		await postgres1.set("ns1:key1", "value1");
+		await postgres2.set("ns2:key1", "value2");
+
+		await postgres1.clear();
+
+		t.expect(await postgres1.get("ns1:key1")).toBeUndefined();
+		t.expect(await postgres2.get("ns2:key1")).toBe("value2");
+	},
+);
+
+test.it(
+	"native namespace: iterator falls back to default limit when iterationLimit is 0",
+	async (t) => {
+		const postgres = new KeyvPostgres({ uri: postgresUri, iterationLimit: 0 });
+		postgres.namespace = "nslimit";
+
+		await postgres.set("nslimit:a", "v1");
+
+		const keys: string[] = [];
+		for await (const [key] of postgres.iterator("nslimit")) {
+			keys.push(key);
+		}
+
+		t.expect(keys).toContain("nslimit:a");
+	},
+);
+
+test.it(
+	"native namespace: iterator with null namespace paginates correctly",
+	async (t) => {
+		const postgres = new KeyvPostgres({ uri: postgresUri, iterationLimit: 2 });
+
+		await postgres.set("a", "v1");
+		await postgres.set("b", "v2");
+		await postgres.set("c", "v3");
+
+		const keys: string[] = [];
+		for await (const [key] of postgres.iterator()) {
+			keys.push(key);
+		}
+
+		t.expect(keys.length).toBe(3);
+		t.expect(keys).toContain("a");
+		t.expect(keys).toContain("b");
+		t.expect(keys).toContain("c");
+	},
+);
+
+test.it(
+	"native namespace: iterator only returns keys from correct namespace",
+	async (t) => {
+		const postgres1 = new KeyvPostgres({ uri: postgresUri });
+		postgres1.namespace = "ns1";
+		const postgres2 = new KeyvPostgres({ uri: postgresUri });
+		postgres2.namespace = "ns2";
+
+		await postgres1.set("ns1:key1", "val1");
+		await postgres1.set("ns1:key2", "val2");
+		await postgres2.set("ns2:key3", "val3");
+
+		const keys: string[] = [];
+		for await (const [key] of postgres1.iterator("ns1")) {
+			keys.push(key);
+		}
+
+		t.expect(keys.length).toBe(2);
+		t.expect(keys).toContain("ns1:key1");
+		t.expect(keys).toContain("ns1:key2");
+	},
+);
