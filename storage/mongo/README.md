@@ -90,7 +90,7 @@ Any additional options are passed through to the MongoDB driver as `MongoClientO
 
 ## Properties
 
-All configuration options are exposed as properties with getters and setters on the `KeyvMongo` instance. You can read or update them after construction.
+Most configuration options are exposed as properties with getters and setters on the `KeyvMongo` instance. You can read or update them after construction. Some properties like `useGridFS` are read-only and can only be set via the constructor.
 
 ### url
 
@@ -132,10 +132,11 @@ console.log(store.namespace); // 'my-namespace'
 
 ### useGridFS
 
-Get or set whether GridFS is used for storing values. When enabled, values are stored using MongoDB's GridFS specification, which is useful for storing large files.
+Get whether GridFS is used for storing values. When enabled, values are stored using MongoDB's GridFS specification, which is useful for storing large files. This property is read-only and can only be set via the constructor, because the connection shape differs between GridFS and standard modes.
 
 - Type: `boolean`
 - Default: `false`
+- Read-only (set via constructor only)
 
 ```js
 const store = new KeyvMongo({ url: 'mongodb://user:pass@localhost:27017/dbname', useGridFS: true });
