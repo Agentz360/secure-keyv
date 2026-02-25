@@ -26,7 +26,6 @@ const keyvMysqlKeys = new Set([
 	"adapter",
 	"compression",
 	"connect",
-	"dialect",
 	"intervalExpiration",
 	"iterationLimit",
 	"keySize",
@@ -51,12 +50,6 @@ type QueryType<T> = Promise<
  * Provides a persistent key-value store using MySQL as the backend.
  */
 export class KeyvMysql extends EventEmitter implements KeyvStoreAdapter {
-	/**
-	 * The database dialect.
-	 * @default 'mysql'
-	 */
-	private _dialect: "mysql" = "mysql";
-
 	/**
 	 * The MySQL connection URI.
 	 * @default 'mysql://localhost'
@@ -92,7 +85,7 @@ export class KeyvMysql extends EventEmitter implements KeyvStoreAdapter {
 	 * The number of rows to fetch per iteration batch.
 	 * @default 10
 	 */
-	private _iterationLimit: string | number = 10;
+	private _iterationLimit = 10;
 
 	/**
 	 * The namespace used to prefix keys for multi-tenant separation.
@@ -108,21 +101,6 @@ export class KeyvMysql extends EventEmitter implements KeyvStoreAdapter {
 	 * Query function for executing SQL statements against the MySQL database.
 	 */
 	query: <T>(sqlString: string) => QueryType<T>;
-
-	/**
-	 * Get the database dialect.
-	 * @default 'mysql'
-	 */
-	public get dialect(): "mysql" {
-		return this._dialect;
-	}
-
-	/**
-	 * Set the database dialect.
-	 */
-	public set dialect(value: "mysql") {
-		this._dialect = value;
-	}
 
 	/**
 	 * Get the MySQL connection URI.
@@ -204,14 +182,14 @@ export class KeyvMysql extends EventEmitter implements KeyvStoreAdapter {
 	 * Get the number of rows to fetch per iteration batch.
 	 * @default 10
 	 */
-	public get iterationLimit(): string | number {
+	public get iterationLimit(): number {
 		return this._iterationLimit;
 	}
 
 	/**
 	 * Set the number of rows to fetch per iteration batch.
 	 */
-	public set iterationLimit(value: string | number) {
+	public set iterationLimit(value: number) {
 		this._iterationLimit = value;
 	}
 
@@ -235,7 +213,8 @@ export class KeyvMysql extends EventEmitter implements KeyvStoreAdapter {
 	// biome-ignore lint/suspicious/noExplicitAny: type format
 	public get opts(): any {
 		return {
-			dialect: this._dialect,
+			dialect: "mysql",
+			url: this._uri,
 			uri: this._uri,
 			table: this._table,
 			keySize: this._keySize,
@@ -410,10 +389,6 @@ export class KeyvMysql extends EventEmitter implements KeyvStoreAdapter {
 	 * Applies the given options to the adapter's private variables.
 	 */
 	private setOptions(options: KeyvMysqlOptions): void {
-		if (options.dialect !== undefined) {
-			this._dialect = options.dialect;
-		}
-
 		if (options.uri !== undefined) {
 			this._uri = options.uri;
 		}
@@ -435,7 +410,7 @@ export class KeyvMysql extends EventEmitter implements KeyvStoreAdapter {
 		}
 
 		if (options.iterationLimit !== undefined) {
-			this._iterationLimit = options.iterationLimit;
+			this._iterationLimit = Number(options.iterationLimit);
 		}
 
 		// Extract mysql2 ConnectionOptions (everything not a Keyv-specific key)
@@ -598,7 +573,7 @@ export class KeyvMysql extends EventEmitter implements KeyvStoreAdapter {
 	async *iterator(
 		namespace?: string,
 	): AsyncGenerator<[string, string], void, unknown> {
-		const limit = Number.parseInt(String(this._iterationLimit), 10) || 10;
+		const limit = this._iterationLimit || 10;
 		const namespaceValue = namespace ?? "";
 		let lastKey: string | null = null;
 
