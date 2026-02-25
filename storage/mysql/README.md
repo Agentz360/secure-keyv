@@ -18,7 +18,7 @@ MySQL/MariaDB storage adapter for [Keyv](https://github.com/jaredwray/keyv).
 - [Properties](#properties)
   - [uri](#uri)
   - [table](#table)
-  - [keySize](#keysize)
+  - [keyLength](#keylength)
   - [namespaceLength](#namespacelength)
   - [iterationLimit](#iterationlimit)
   - [intervalExpiration](#intervalexpiration)
@@ -56,7 +56,7 @@ const keyv = new Keyv(new KeyvMysql('mysql://user:pass@localhost:3306/dbname'));
 keyv.on('error', handleConnectionError);
 ```
 
-You can specify a custom table with the `table` option and the primary key size with `keySize`.
+You can specify a custom table with the `table` option and the primary key length with `keyLength`.
 If you want to use native MySQL scheduler to delete expired keys, you can specify `intervalExpiration` in seconds.
 
 e.g:
@@ -68,7 +68,7 @@ import KeyvMysql from '@keyv/mysql';
 const keyv = new Keyv(new KeyvMysql({
   uri: 'mysql://user:pass@localhost:3306/dbname',
   table: 'cache',
-  keySize: 255,
+  keyLength: 255,
   intervalExpiration: 60
 }));
 ```
@@ -82,6 +82,20 @@ const keyv = new Keyv(new KeyvMysql({
 In v5, namespaces were stored as key prefixes in the `id` column (e.g. `id="myns:mykey"` with `namespace=''`). In v6, the namespace is stored in a dedicated `namespace` column (e.g. `id="mykey"`, `namespace="myns"`). This enables more efficient queries and proper namespace isolation.
 
 The adapter automatically adds the `namespace` column and creates the appropriate index when it connects, so no manual schema changes are needed for new installations.
+
+#### `keySize` renamed to `keyLength`
+
+The `keySize` option and property has been renamed to `keyLength` for consistency with the migration script and to better reflect that it controls VARCHAR column length.
+
+```js
+// v5
+const store = new KeyvMysql({ uri, keySize: 512 });
+store.keySize; // 512
+
+// v6
+const store = new KeyvMysql({ uri, keyLength: 512 });
+store.keyLength; // 512
+```
 
 #### Properties instead of opts
 
@@ -98,7 +112,7 @@ In v6, all configuration options are exposed as top-level properties with getter
 ```js
 // v6
 store.table; // 'keyv'
-store.keySize; // 255
+store.keyLength; // 255
 store.table = 'cache';
 ```
 
@@ -167,9 +181,9 @@ The migration script also populates the new `expires` column from existing JSON 
 | --- | --- | --- | --- |
 | `uri` | `string` | `'mysql://localhost'` | MySQL connection URI |
 | `table` | `string` | `'keyv'` | Table name for key-value storage |
-| `keySize` | `number` | `255` | Maximum key column length (VARCHAR length) |
+| `keyLength` | `number` | `255` | Maximum key length (VARCHAR length) |
 | `namespaceLength` | `number` | `255` | Maximum namespace column length (VARCHAR length) |
-| `iterationLimit` | `string \| number` | `10` | Number of rows fetched per batch during iteration |
+| `iterationLimit` | `number` | `10` | Number of rows fetched per batch during iteration |
 | `intervalExpiration` | `number` | `undefined` | Interval in seconds for automatic expiration cleanup via MySQL event scheduler |
 
 ## Properties
@@ -201,16 +215,16 @@ console.log(store.table); // 'keyv'
 store.table = 'cache';
 ```
 
-### keySize
+### keyLength
 
-Get or set the maximum key size (VARCHAR length) for the key column.
+Get or set the maximum key length (VARCHAR length) for the key column.
 
 - Type: `number`
 - Default: `255`
 
 ```js
-const store = new KeyvMysql({ uri: 'mysql://user:pass@localhost:3306/dbname', keySize: 512 });
-console.log(store.keySize); // 512
+const store = new KeyvMysql({ uri: 'mysql://user:pass@localhost:3306/dbname', keyLength: 512 });
+console.log(store.keyLength); // 512
 ```
 
 ### namespaceLength
@@ -227,9 +241,9 @@ console.log(store.namespaceLength); // 512
 
 ### iterationLimit
 
-Get or set the number of rows to fetch per iteration batch. Accepts both numbers and string representations of numbers.
+Get or set the number of rows to fetch per iteration batch.
 
-- Type: `string | number`
+- Type: `number`
 - Default: `10`
 
 ```js
