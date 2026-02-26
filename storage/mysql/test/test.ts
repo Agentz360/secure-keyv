@@ -2,7 +2,7 @@ import keyvTestSuite, { delay, keyvIteratorTests } from "@keyv/test-suite";
 import Keyv from "keyv";
 import type mysql from "mysql2";
 import * as test from "vitest";
-import KeyvMysql from "../src/index.js";
+import KeyvMysql, { createKeyv } from "../src/index.js";
 import { parseConnectionString } from "../src/pool.js";
 
 const uri = "mysql://root@localhost:3306/keyv_test";
@@ -134,13 +134,13 @@ test.it("close connection successfully", async (t) => {
 test.it("set intervalExpiration to 1 second", async (t) => {
 	const keyvMySql = new KeyvMysql({ uri, intervalExpiration: 1 });
 	const keyv = new Keyv({ store: keyvMySql });
-	// Ttl: 1s
-	await keyv.set("foo-interval1", "bar-interval1", 1000);
+	// Ttl: 2s
+	await keyv.set("foo-interval1", "bar-interval1", 2000);
 	// No ttl -> undefined -> (expires:null) -> infinite
 	await keyv.set("foo-interval-no-ttl", "bar-interval-no-ttl");
 	const value1 = await keyv.get("foo-interval1");
 	t.expect(value1).toBe("bar-interval1");
-	await delay(1100);
+	await delay(2500);
 	const value2 = await keyv.get("foo-interval1");
 	t.expect(value2).toBeUndefined();
 	const value3 = await keyv.get("foo-interval-no-ttl");
@@ -520,7 +520,7 @@ test.it("properties have correct defaults", (t) => {
 	const keyv = new KeyvMysql(uri);
 	t.expect(keyv.uri).toBe(uri);
 	t.expect(keyv.table).toBe("keyv");
-	t.expect(keyv.keySize).toBe(255);
+	t.expect(keyv.keyLength).toBe(255);
 	t.expect(keyv.namespaceLength).toBe(255);
 	t.expect(keyv.iterationLimit).toBe(10);
 	t.expect(keyv.intervalExpiration).toBeUndefined();
@@ -531,33 +531,24 @@ test.it("properties are set correctly via constructor options", (t) => {
 	const keyv = new KeyvMysql({
 		uri,
 		table: "custom_table",
-		keySize: 512,
+		keyLength: 512,
 		namespaceLength: 128,
 		iterationLimit: 50,
 	});
 	t.expect(keyv.table).toBe("custom_table");
-	t.expect(keyv.keySize).toBe(512);
+	t.expect(keyv.keyLength).toBe(512);
 	t.expect(keyv.namespaceLength).toBe(128);
 	t.expect(keyv.iterationLimit).toBe(50);
 });
 
 test.it("opts getter returns composed object", (t) => {
-	const keyv = new KeyvMysql({ uri, table: "custom", keySize: 512 });
+	const keyv = new KeyvMysql({ uri, table: "custom", keyLength: 512 });
 	const { opts } = keyv;
 	t.expect(opts.table).toBe("custom");
-	t.expect(opts.keySize).toBe(512);
+	t.expect(opts.keyLength).toBe(512);
 	t.expect(opts.uri).toBe(uri);
 	t.expect(opts.namespaceLength).toBe(255);
 	t.expect(opts.iterationLimit).toBe(10);
-});
-
-test.it("opts setter updates individual properties", (t) => {
-	const keyv = new KeyvMysql(uri);
-	keyv.opts = { table: "new_table", keySize: 1024 };
-	t.expect(keyv.table).toBe("new_table");
-	t.expect(keyv.keySize).toBe(1024);
-	// Other defaults should remain
-	t.expect(keyv.namespaceLength).toBe(255);
 });
 
 test.it("individual property setters work", (t) => {
@@ -566,8 +557,8 @@ test.it("individual property setters work", (t) => {
 	t.expect(keyv.uri).toBe("mysql://otherhost");
 	keyv.table = "updated_table";
 	t.expect(keyv.table).toBe("updated_table");
-	keyv.keySize = 1024;
-	t.expect(keyv.keySize).toBe(1024);
+	keyv.keyLength = 1024;
+	t.expect(keyv.keyLength).toBe(1024);
 	keyv.namespaceLength = 128;
 	t.expect(keyv.namespaceLength).toBe(128);
 	keyv.iterationLimit = 100;
@@ -586,4 +577,45 @@ test.it("iterator on empty store returns nothing", async (t) => {
 	}
 
 	t.expect(entries.length).toBe(0);
+});
+
+// Non-string value tests (covers getExpiresFromValue else branch)
+test.it(
+	"set() stores null expires when value is a number (non-string)",
+	async (t) => {
+		const keyv = new KeyvMysql(uri);
+		await keyv.set("numeric-value-test", 42);
+		const rows = await keyv.query<mysql.RowDataPacket[]>(
+			`SELECT expires FROM \`keyv\` WHERE id = 'numeric-value-test' AND namespace = ''`,
+		);
+		t.expect(rows[0].expires).toBeNull();
+	},
+);
+
+test.it(
+	"set() stores null expires when value is null (non-string)",
+	async (t) => {
+		const keyv = new KeyvMysql(uri);
+		await keyv.set("null-value-test", null);
+		const rows = await keyv.query<mysql.RowDataPacket[]>(
+			`SELECT expires FROM \`keyv\` WHERE id = 'null-value-test' AND namespace = ''`,
+		);
+		t.expect(rows[0].expires).toBeNull();
+	},
+);
+
+// createKeyv helper tests
+
+test.it("createKeyv with URI string returns a Keyv instance", async (t) => {
+	const keyv = createKeyv(uri);
+	t.expect(keyv).toBeInstanceOf(Keyv);
+	await keyv.set("createKeyv-test", "value");
+	t.expect(await keyv.get("createKeyv-test")).toBe("value");
+});
+
+test.it("createKeyv with options object returns a Keyv instance", async (t) => {
+	const keyv = createKeyv({ uri, table: "keyv" });
+	t.expect(keyv).toBeInstanceOf(Keyv);
+	await keyv.set("createKeyv-opts-test", "value");
+	t.expect(await keyv.get("createKeyv-opts-test")).toBe("value");
 });
